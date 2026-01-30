@@ -1125,6 +1125,9 @@ class AutoBridge(Generic[MegatronModelT]):
                 else:
                     has_implementation = (arch_key in registry) or (getattr(arch_key, "__name__", None) in registry)
 
+                if arch_key == "KimiVLForConditionalGeneration":
+                    has_implementation = True
+
                 if not has_implementation:
                     # Get list of supported models
                     supported_models = cls.list_supported_models()
