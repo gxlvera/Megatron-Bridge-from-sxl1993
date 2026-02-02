@@ -1,19 +1,28 @@
 
-
-from typing import Dict, Mapping
+import logging
+from typing import Dict, Mapping, Union
 
 import torch
 import torch.nn as nn
+from megatron.core import parallel_state
 from transformers.generation.utils import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge, WeightConversionTask
-from megatron.bridge.models.deepseek.common import get_common_configs
+from megatron.bridge.models.conversion.param_mapping import (
+    AutoMapping,
+    GatedMLPMapping,
+    QKVMapping,
+    ReplicatedMapping,
+)
 from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
 from megatron.bridge.models.kimi_vl.kimi_vl_provider import KimiVLMoEModelProvider
 from megatron.bridge.models.kimi_vl.modelling_kimi_vl.model import KimiVLModel
 from megatron.bridge.models.kimi_vl.modelling_kimi_vl.transfomer_config import KimiVLConfig
+from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+
+logger = logging.getLogger(__name__)
 
 
 class KimiVLPreTrainedModel(PreTrainedModel, GenerationMixin):
@@ -55,6 +64,11 @@ class KimiVLForConditionalGeneration(KimiVLPreTrainedModel, GenerationMixin):
 @MegatronModelBridge.register_bridge(source=KimiVLForConditionalGeneration, target=KimiVLModel)
 class KimiVLMoEBridge(MegatronModelBridge):
 
+    def __init__(self):
+        super().__init__()
+        # Cache expert shards during HF export until all ranks contribute.
+        self.hf_weights_cache: Dict[str, Dict[int, torch.Tensor]] = {}
+
     def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> KimiVLMoEModelProvider:       
         hf_config = hf_pretrained.config
         text_config = hf_config.text_config
@@ -64,7 +78,7 @@ class KimiVLMoEBridge(MegatronModelBridge):
         vision_config = hf_config.vision_config
         vision_config.torch_dtype = model_dtype
         
-        breakpoint()
+        # breakpoint()
         
 
         provider = KimiVLMoEModelProvider(
@@ -92,6 +106,10 @@ class KimiVLMoEBridge(MegatronModelBridge):
 
         return provider
 
+    def get_hf_tokenizer_kwargs(self) -> dict:
+        # Kimi-VL tokenizer relies on custom code.
+        return {"trust_remote_code": True}
+
     def mapping_registry(self) -> MegatronMappingRegistry:
         """
         Return MegatronMappingRegistry containing parameter mappings for MoE models.
@@ -109,60 +127,71 @@ class KimiVLMoEBridge(MegatronModelBridge):
         Returns:
             MegatronMappingRegistry with all MoE parameter mappings
         """
-        # Language model direct mappings (same as dense model)
+        hf_prefix = "language_model."
+
+        # Language model direct mappings (DeepSeek-style MLA/MoE)
         param_mappings = {
             # Embeddings and output layers
-            "language_model.embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
-            "language_model.output_layer.weight": "lm_head.weight",
-            "language_model.decoder.final_layernorm.weight": "model.language_model.norm.weight",
+            "language_model.embedding.word_embeddings.weight": f"{hf_prefix}model.embed_tokens.weight",
+            "language_model.output_layer.weight": f"{hf_prefix}lm_head.weight",
+            "language_model.decoder.final_layernorm.weight": f"{hf_prefix}model.norm.weight",
             # Layer normalization for attention
-            "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.language_model.layers.*.input_layernorm.weight",
+            "language_model.decoder.layers.*.input_layernorm.weight": f"{hf_prefix}model.layers.*.input_layernorm.weight",
             # MoE-specific: pre-MLP layernorm
-            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": "model.language_model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.pre_mlp_layernorm.weight": f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
+            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": f"{hf_prefix}model.layers.*.post_attention_layernorm.weight",
             # Attention output projection
-            "language_model.decoder.layers.*.self_attention.linear_proj.weight": "model.language_model.layers.*.self_attn.o_proj.weight",
-            # QK layernorm weights (Qwen3 specific)
-            "language_model.decoder.layers.*.self_attention.q_layernorm.weight": "model.language_model.layers.*.self_attn.q_norm.weight",
-            "language_model.decoder.layers.*.self_attention.k_layernorm.weight": "model.language_model.layers.*.self_attn.k_norm.weight",
+            "language_model.decoder.layers.*.self_attention.linear_proj.weight": f"{hf_prefix}model.layers.*.self_attn.o_proj.weight",
+            # MLA Q/KV projections
+            "language_model.decoder.layers.*.self_attention.linear_q_proj.weight": f"{hf_prefix}model.layers.*.self_attn.q_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_down_proj.weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.weight": f"{hf_prefix}model.layers.*.self_attn.kv_b_proj.weight",
+            "language_model.decoder.layers.*.self_attention.linear_kv_up_proj.layer_norm_weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
+            "language_model.decoder.layers.*.self_attention.kv_layernorm.weight": f"{hf_prefix}model.layers.*.self_attn.kv_a_layernorm.weight",
             # MoE router weights
-            "language_model.decoder.layers.*.mlp.router.weight": "model.language_model.layers.*.mlp.gate.weight",
+            "language_model.decoder.layers.*.mlp.router.weight": f"{hf_prefix}model.layers.*.mlp.gate.weight",
+            "language_model.decoder.layers.*.mlp.router.expert_bias": f"{hf_prefix}model.layers.*.mlp.gate.e_score_correction_bias",
+            # Dense/Shared experts down proj
+            "language_model.decoder.layers.*.mlp.linear_fc2.weight": f"{hf_prefix}model.layers.*.mlp.down_proj.weight",
+            "language_model.decoder.layers.*.mlp.shared_experts.linear_fc2.weight": f"{hf_prefix}model.layers.*.mlp.shared_experts.down_proj.weight",
         }
 
         mapping_list = []
-
-        # Convert simple 1:1 mappings to AutoMapping objects
         for megatron_param, hf_param in param_mappings.items():
             mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
 
-        # Add special mappings that require parameter transformation
         mapping_list.extend(
             [
-                # Vision model weights are replicated directly
+                # Vision tower and projector weights
                 ReplicatedMapping(
                     megatron_param="vision_model.**",
-                    hf_param="model.visual.**",
+                    hf_param="vision_tower.**",
                 ),
-                # QKV mapping: Combine separate Q, K, V matrices
-                QKVMapping(
-                    megatron_param="language_model.decoder.layers.*.self_attention.linear_qkv.weight",
-                    q="model.language_model.layers.*.self_attn.q_proj.weight",
-                    k="model.language_model.layers.*.self_attn.k_proj.weight",
-                    v="model.language_model.layers.*.self_attn.v_proj.weight",
+                AutoMapping(
+                    megatron_param="multi_modal_projector.**",
+                    hf_param="multi_modal_projector.**",
                 ),
-                # QKV bias mapping (if attention_bias is True)
-                QKVMapping(
-                    megatron_param="language_model.decoder.layers.*.self_attention.linear_qkv.bias",
-                    q="model.language_model.layers.*.self_attn.q_proj.bias",
-                    k="model.language_model.layers.*.self_attn.k_proj.bias",
-                    v="model.language_model.layers.*.self_attn.v_proj.bias",
+                # Dense MLP mappings (for non-MoE layers)
+                GatedMLPMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.linear_fc1.weight",
+                    gate=f"{hf_prefix}model.layers.*.mlp.gate_proj.weight",
+                    up=f"{hf_prefix}model.layers.*.mlp.up_proj.weight",
                 ),
-                ExpertMLPGateUpProjMapping(
+                # Expert MLP mappings (gate/up are separate in HF)
+                GatedMLPMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc1.weight*",
-                    hf_param="model.language_model.layers.*.mlp.experts.gate_up_proj",
+                    gate=f"{hf_prefix}model.layers.*.mlp.experts.*.gate_proj.weight",
+                    up=f"{hf_prefix}model.layers.*.mlp.experts.*.up_proj.weight",
                 ),
-                ExpertMLPDownProjMapping(
+                AutoMapping(
                     megatron_param="language_model.decoder.layers.*.mlp.experts.linear_fc2.weight*",
-                    hf_param="model.language_model.layers.*.mlp.experts.down_proj",
+                    hf_param=f"{hf_prefix}model.layers.*.mlp.experts.*.down_proj.weight",
+                ),
+                # Shared experts gate+up projections
+                GatedMLPMapping(
+                    megatron_param="language_model.decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
+                    gate=f"{hf_prefix}model.layers.*.mlp.shared_experts.gate_proj.weight",
+                    up=f"{hf_prefix}model.layers.*.mlp.shared_experts.up_proj.weight",
                 ),
             ]
         )
@@ -175,7 +204,41 @@ class KimiVLMoEBridge(MegatronModelBridge):
         converted_weights_dict: Dict[str, torch.Tensor],
         hf_state_dict: Mapping[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        num_experts = self.hf_config.text_config.num_experts
+        # Add rotary inv_freq if expected but missing (export path)
+        global_name = task.global_param_name
+        if global_name.startswith("language_model.decoder.layers.") and global_name.endswith(".input_layernorm.weight"):
+            parts = global_name.split(".")
+            if len(parts) >= 4 and parts[3].isdigit():
+                layer_idx = int(parts[3])
+                inv_freq_key = f"language_model.model.layers.{layer_idx}.self_attn.rotary_emb.inv_freq"
+                if inv_freq_key not in converted_weights_dict and inv_freq_key in hf_state_dict:
+                    inv_freq = getattr(self, "_kimi_inv_freq", None)
+                    if inv_freq is None:
+                        text_config = self.hf_config.text_config
+                        rotary_dim = text_config.qk_rope_head_dim
+                        rotary_base = text_config.rope_theta
+                        inv_freq = 1.0 / (rotary_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+                        self._kimi_inv_freq = inv_freq
+                    if converted_weights_dict:
+                        reference_tensor = next(iter(converted_weights_dict.values()))
+                        if inv_freq.device != reference_tensor.device:
+                            inv_freq = inv_freq.to(device=reference_tensor.device)
+                            self._kimi_inv_freq = inv_freq
+                    # Avoid shared storage across layers for safetensors.
+                    converted_weights_dict[inv_freq_key] = inv_freq.clone()
+
+        # If we're exporting per-expert tensors on a single EP rank, just return them.
+        if parallel_state.get_expert_model_parallel_world_size() == 1 and any(
+            ".mlp.experts." in key or ".mlp.shared_experts." in key for key in converted_weights_dict
+        ):
+            return converted_weights_dict
+
+        text_config = self.hf_config.text_config
+        num_experts = getattr(text_config, "num_experts", None)
+        if num_experts is None:
+            num_experts = getattr(text_config, "n_routed_experts", None)
+        if num_experts is None:
+            return converted_weights_dict
         ep_size = parallel_state.get_expert_model_parallel_world_size()
         experts_per_rank = num_experts // ep_size
 
@@ -185,9 +248,7 @@ class KimiVLMoEBridge(MegatronModelBridge):
             # not an expert weight
             return converted_weights_dict
 
-        assert len(converted_weights_dict) == 1, (
-            f"There should be only one key in the converted_weights_dict, got keys: {converted_weights_dict.keys()}"
-        )
+        result: Dict[str, torch.Tensor] = {}
         for key, value in converted_weights_dict.items():
             if key not in self.hf_weights_cache:
                 self.hf_weights_cache[key] = {}
@@ -202,7 +263,7 @@ class KimiVLMoEBridge(MegatronModelBridge):
                     global_expert_number = local_expert_number + (i * experts_per_rank)
                     self.hf_weights_cache[key][global_expert_number] = exp_val
             if len(self.hf_weights_cache[key]) == num_experts:
-                logging.debug(f"All experts are loaded for {key}")
+                logger.debug("All experts are loaded for %s", key)
                 # all experts are loaded
                 if self.hf_weights_cache[key][0].ndim == 3:  # expert 0
                     # gate up
@@ -213,19 +274,85 @@ class KimiVLMoEBridge(MegatronModelBridge):
                         [self.hf_weights_cache[key][i][1].unsqueeze(0) for i in range(num_experts)], dim=0
                     )
                     del self.hf_weights_cache[key]
-                    return {key: torch.cat([merged_hf_gate_weights, merged_hf_up_weights], dim=-1)}
+                    result[key] = torch.cat([merged_hf_gate_weights, merged_hf_up_weights], dim=-1)
                 elif self.hf_weights_cache[key][0].ndim == 2:  # expert 0
                     # down
                     merged_hf_down_weights = torch.cat(
                         [self.hf_weights_cache[key][i].unsqueeze(0) for i in range(num_experts)], dim=0
                     )
                     del self.hf_weights_cache[key]
-                    return {key: merged_hf_down_weights}
+                    result[key] = merged_hf_down_weights
                 else:
                     raise ValueError(
                         f"Incorrect shape of self.hf_weights_cache[key]: {key} {self.hf_weights_cache[key].shape}"
                     )
             else:
                 # not all experts are loaded yet, return empty dict
-                logging.debug(f"{len(self.hf_weights_cache[key])}/{num_experts} experts are loaded for {key}")
-                return {}
+                logger.debug("%s/%s experts are loaded for %s", len(self.hf_weights_cache[key]), num_experts, key)
+                continue
+
+        if result:
+            return result
+        return {}
+
+
+class ExpertMLPDownProjMapping(AutoMapping):
+    """Mapping for expert MLP down projection weights between HF and Megatron formats."""
+
+    def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
+        global_expert_number = extract_expert_number_from_param(self.megatron_param)
+        # hf_weights: [num_experts, down_in, mlp_out]
+        expert_weight = hf_weights[global_expert_number].transpose(0, 1).contiguous()
+        return super().hf_to_megatron(expert_weight, megatron_module)
+
+    def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
+        # [ep_size, down_in, mlp_out]
+        # experts need subsequently merged by maybe_modify_converted_hf_weight
+        converted_weights_dict = super().megatron_to_hf(megatron_weights, megatron_module)
+        for key in converted_weights_dict:
+            converted_weights_dict[key] = converted_weights_dict[key].transpose(-1, -2).contiguous()
+        return converted_weights_dict
+
+    def _validate_patterns(self, *args, **kwargs):
+        # allow number of wildcards to mismatch in this mapping
+        pass
+
+
+class ExpertMLPGateUpProjMapping(AutoMapping):
+    """Mapping for expert MLP gate+up projection using shared GatedMLPMapping logic."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Qwen3-VL MoE expert shards use mismatched wildcard counts; relax validation globally.
+        GatedMLPMapping._validate_patterns = lambda *args, **kwargs: None
+
+        # Reuse the generic TP-aware split/gather, but we still handle expert selection
+        # and HF<->Megatron transpose at this wrapper layer.
+        self._gated_mapping = GatedMLPMapping(
+            megatron_param=self.megatron_param,
+            gate=f"{self.hf_param}.gate",
+            up=f"{self.hf_param}.up",
+        )
+
+    def hf_to_megatron(self, hf_weights: Union[torch.Tensor, Dict], megatron_module: nn.Module) -> torch.Tensor:
+        global_expert_number = extract_expert_number_from_param(self.megatron_param)
+        # hf_weights: [num_experts, mlp_in, fused_gate_up_out]
+        expert_weight = hf_weights[global_expert_number].transpose(0, 1).contiguous()
+
+        # HF gate_up_proj is [2 * hidden, hidden]; Megatron expects transposed.
+        gate, up = torch.chunk(expert_weight, 2, dim=0)
+        return self._gated_mapping.hf_to_megatron({"gate": gate, "up": up}, megatron_module)
+
+    def megatron_to_hf(self, megatron_weights: torch.Tensor, megatron_module: nn.Module) -> Dict[str, torch.Tensor]:
+        # Let the shared mapping handle TP/PP/EP gather.
+        # We only split gate+up at the end for HF format.
+        converted_weights_dict = self._gated_mapping.megatron_to_hf(megatron_weights, megatron_module)
+        for key in converted_weights_dict:
+            gate, up = torch.chunk(converted_weights_dict[key], 2, dim=-2)
+            converted_weights_dict[key] = torch.stack([gate, up], dim=0)
+        return converted_weights_dict
+
+    def _validate_patterns(self, *args, **kwargs):
+        # allow number of wildcards to mismatch in this mapping
+        pass
