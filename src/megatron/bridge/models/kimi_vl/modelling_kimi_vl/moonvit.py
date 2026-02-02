@@ -231,6 +231,19 @@ class MoonVisionPatchEmbed(nn.Module):
 
         self.pos_emb = Learnable2DInterpPosEmb(height=pos_emb_height, width=pos_emb_width, dim=out_dim)
 
+    def forward(self, x: torch.Tensor, grid_hws: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (L, Channels): input tensor
+            grid_hws (N, 2): grid height and width
+
+        Returns:
+            (L, Cout) tensor
+        """
+        x = self.proj(x).view(x.size(0), -1)
+        x = self.pos_emb(x, grid_hws)
+        return x
+
 
 class Rope2DPosEmb(nn.Module):
     """2D rotary position embedding with multi-resolution support.
