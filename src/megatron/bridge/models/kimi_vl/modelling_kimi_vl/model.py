@@ -167,6 +167,18 @@ class KimiVLModel(MegatronModule):
                     image_input_mask = (input_ids == image_token_id)
 
             if image_input_mask is not None and image_input_mask.any():
+                # Ensure pixel_values dtype matches vision encoder params (e.g. bf16)
+                vision_dtype = None
+                if hasattr(self.vision_model, "patch_embed") and hasattr(self.vision_model.patch_embed, "proj"):
+                    vision_dtype = self.vision_model.patch_embed.proj.weight.dtype
+                else:
+                    try:
+                        vision_dtype = next(self.vision_model.parameters()).dtype
+                    except StopIteration:
+                        vision_dtype = None
+                if vision_dtype is not None and pixel_values.dtype != vision_dtype:
+                    pixel_values = pixel_values.to(dtype=vision_dtype)
+
                 vision_embeds = self.vision_model(
                         pixel_values=pixel_values,
                         grid_hws=grid_param if grid_param is not None else torch.tensor([[64, 64]], device=pixel_values.device)
