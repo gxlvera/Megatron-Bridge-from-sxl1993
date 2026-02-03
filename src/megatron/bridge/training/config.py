@@ -24,10 +24,14 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig as MCoreOptimizerConfig
-from megatron.core.optimizer import (
-    ParamGroupOverride,
-    ParamKey,
-)
+try:
+    from megatron.core.optimizer import ParamGroupOverride, ParamKey
+except ImportError:  # megatron-core 0.16.0rc0 doesn't support this
+    class ParamGroupOverride:  # type: ignore
+        pass
+
+    class ParamKey:  # type: ignore
+        pass
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 

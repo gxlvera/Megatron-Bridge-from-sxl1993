@@ -18,9 +18,16 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 import torch.nn.functional as F
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_transformer_block_with_experimental_attention_variant_spec,
-)
+try:
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_transformer_block_with_experimental_attention_variant_spec,
+    )
+except ImportError:# megatron-core 0.16.0rc0 doesn't support this
+    def get_transformer_block_with_experimental_attention_variant_spec(*_args, **_kwargs):
+        raise ImportError(
+            "Qwen3-Next requires a newer megatron-core that provides "
+            "get_transformer_block_with_experimental_attention_variant_spec."
+        )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
