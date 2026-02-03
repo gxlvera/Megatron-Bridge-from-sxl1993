@@ -14,7 +14,6 @@
 
 """
 Qwen3 VL MoE Model Provider configurations for Megatron-Core.
-
 This module provides configuration classes for Qwen3-VL MoE (Mixture of Experts) multimodal models,
 compatible with HuggingFace's Qwen3-VL-MoE model configurations.
 Reference: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
@@ -51,6 +50,8 @@ class KimiVLMoEModelProvider(MoonlightModelProvider16B):
     freeze_vision_model: bool = True
     # Whether to freeze vision-to-language projection weights
     freeze_vision_projection: bool = False
+    # Whether to scatter embedding for sequence parallel
+    scatter_embedding_sequence_parallel: bool = False
 
 
     def finalize(self) -> None:
@@ -83,19 +84,16 @@ class KimiVLMoEModelProvider(MoonlightModelProvider16B):
 
         return model
 
-    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None) -> GPTModel:
+    def provide_language_model(self, pre_process=None, post_process=None, vp_stage=None, **kwargs) -> GPTModel:
         """
         Provide just the language model component without vision.
-
         Args:
             pre_process: Whether this is the first stage in pipeline parallelism
             post_process: Whether this is the last stage in pipeline parallelism
             vp_stage: Virtual pipeline stage number
-
+            **kwargs: Additional arguments (e.g., scatter_embedding_sequence_parallel)
         Returns:
             GPTModel instance (language model only)
         """
         # Use parent class to create standard language model
-        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-
-
+        return super().provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage, **kwargs)

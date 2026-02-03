@@ -11,8 +11,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
-from packaging.version import Version as PkgVersion
-from torch import nn
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.kimi_vl.modelling_kimi_vl.moonvit import MoonVitPretrainedModel
@@ -24,6 +22,7 @@ from megatron.bridge.models.kimi_vl.modelling_kimi_vl.transfomer_config import (
     MoonViTConfig,
 )
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+import torch.nn as nn
 
 
 def is_transformers_min_version(version):
@@ -70,21 +69,24 @@ class KimiVLModel(MegatronModule):
             hook_hf_module_setattr_for_tp_grad_sync(self.vision_model)
 
         self.language_model = self.config.provide_language_model(
-            pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+            pre_process=pre_process, 
+            post_process=post_process, 
+            vp_stage=vp_stage,
         )
 
-    # def shared_embedding_or_output_weight(self):
-    #     """This is a convenience method to surface the language model's word embeddings, which is
-    #     necessary for `finalize_model_grads._allreduce_word_embedding_grads`."""
-    #     if self.add_decoder:
-    #         return self.language_model.shared_embedding_or_output_weight()
-    #     return None
+    def shared_embedding_or_output_weight(self):
+        """This is a convenience method to surface the language model's word embeddings, which is
+        necessary for `finalize_model_grads._allreduce_word_embedding_grads`."""
+        if self.add_decoder:
+            return self.language_model.shared_embedding_or_output_weight()
+        return None
 
     def set_input_tensor(self, input_tensor) -> None:
         """Set model chunk input tensor for pipeline parallelism."""
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
         assert len(input_tensor) == 1, "input_tensor should only be length 1 for KimiVL"
+
 
         if self.pre_process:
             self.encoder_hidden_state = input_tensor[0]
@@ -141,119 +143,210 @@ class KimiVLModel(MegatronModule):
         image_grid_hws: torch.Tensor = None,
         image_input_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        assert pixel_values_videos is None and video_grid_thw is None, "not support video now"
-        assert inference_params is None, "not support inference"
+        # Video not supported
+        # breakpoint()
+        if pixel_values_videos is not None or video_grid_thw is not None:
+            raise NotImplementedError("Video not supported yet for KimiVL")
 
-        image_mask = None
-        if self.pre_process and input_ids is not None:
-            image_mask = image_input_mask
-            if image_mask is None:
-                image_mask = (input_ids == self.image_token_id).contiguous()
+        # Handle parameter name compatibility: some callers use image_grid_hws instead of image_grid_thw
+        grid_param = image_grid_hws if image_grid_hws is not None else image_grid_thw
 
-        combined_embeddings = None
-        if self.pre_process:
-            image_features = None
-            if pixel_values is not None and image_mask is not None and image_mask.sum().item() > 0:
-                if image_grid_hws is None and image_grid_thw is not None:
-                    image_grid_hws = image_grid_thw[:, 1:] if image_grid_thw.shape[-1] == 3 else image_grid_thw
-                if image_grid_hws is None:
-                    raise ValueError("image_grid_hws is required when pixel_values are provided")
-                vision_dtype = getattr(self.vision_model, "dtype", None)
-                if vision_dtype is None and hasattr(self.vision_model, "patch_embed"):
-                    vision_dtype = self.vision_model.patch_embed.proj.weight.dtype
-                if vision_dtype is not None:
-                    pixel_values = pixel_values.to(dtype=vision_dtype)
-                image_features_list = self.vision_model(pixel_values, image_grid_hws)
-                image_features = self.multi_modal_projector(image_features_list)
+        # Compute position IDs if needed (do this early since embedding layer needs it)
+        if position_ids is None:
+            seq_len = input_ids.size(1)
+            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
 
-            combined_embeddings = self.language_model.embedding(
-                input_ids=input_ids,
-                position_ids=None,
-            ).clone()
+        # If we have images, process them
+        # breakpoint()
+        if self.pre_process and pixel_values is not None:
+            # Get image mask if not provided
+            if image_input_mask is None:
+                # Try to get image token ID from config
+                image_token_id = self.image_token_id
+                if image_token_id is not None:
+                    image_input_mask = (input_ids == image_token_id)
 
-            if image_features is not None:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [b, s, h]
-                if self.config.sequence_parallel:
-                    tp_size = mpu.get_tensor_model_parallel_world_size()
-                    tp_rank = mpu.get_tensor_model_parallel_rank()
-                    image_mask_chunks = image_mask.chunk(tp_size, dim=-1)
-                    local_image_mask = image_mask_chunks[tp_rank]
-                    counts = [int(m.sum().item()) for m in image_mask_chunks]
-                    start = sum(counts[:tp_rank])
-                    end = start + counts[tp_rank]
-                    local_image_features = image_features[start:end]
-                    combined_embeddings[local_image_mask] = local_image_features
-                else:
-                    combined_embeddings[image_mask] = image_features
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [s, b, h]
+            if image_input_mask is not None and image_input_mask.any():
+                vision_embeds = self.vision_model(
+                        pixel_values=pixel_values,
+                        grid_hws=grid_param if grid_param is not None else torch.tensor([[64, 64]], device=pixel_values.device)
+                    )
 
+                
+                # Project to text space if projector exists
+                vision_embeds = self.multi_modal_projector(vision_embeds)
+                    
+                # Get text embeddings
+                combined_embeddings = self.language_model.embedding(input_ids, position_ids=position_ids).clone()
+
+                # Replace image token embeddings with vision embeddings
+                # Simple implementation: assume vision_embeds align with image positions
+
+                # breakpoint()
+                if vision_embeds is not None:
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                    combined_embeddings[image_input_mask] = vision_embeds
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
+                
             if self.config.sequence_parallel:
                 combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
                 combined_embeddings = combined_embeddings.contiguous()
 
-        if position_ids is None and input_ids is not None:
-            if attention_mask is not None and attention_mask.dim() == 2:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-            else:
-                seq_len = input_ids.size(1)
-                position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+        else:
+            # No pre-processing, language model will handle embeddings
+            combined_embeddings = None
 
-        local_packed_seq_params = packed_seq_params
-        if packed_seq_params is not None and input_ids is not None and packed_seq_params.cu_seqlens_q is not None:
-            total_tokens = input_ids.shape[1]
-            cu_total = int(packed_seq_params.cu_seqlens_q[-1].item())
-            scale = None
-            if self.config.sequence_parallel:
-                tp_size = mpu.get_tensor_model_parallel_world_size()
-                if cu_total % tp_size == 0:
-                    scale = tp_size
-            elif cu_total != total_tokens and cu_total % total_tokens == 0:
-                scale = cu_total // total_tokens
-            if scale is not None and scale > 1:
-                cu_q = packed_seq_params.cu_seqlens_q // scale
-                cu_kv = packed_seq_params.cu_seqlens_kv // scale if packed_seq_params.cu_seqlens_kv is not None else None
-                cu_q_padded = (
-                    packed_seq_params.cu_seqlens_q_padded // scale
-                    if packed_seq_params.cu_seqlens_q_padded is not None
-                    else None
-                )
-                cu_kv_padded = (
-                    packed_seq_params.cu_seqlens_kv_padded // scale
-                    if packed_seq_params.cu_seqlens_kv_padded is not None
-                    else None
-                )
-                local_packed_seq_params = dataclasses.replace(
-                    packed_seq_params,
-                    cu_seqlens_q=cu_q,
-                    cu_seqlens_kv=cu_kv,
-                    cu_seqlens_q_padded=cu_q_padded,
-                    cu_seqlens_kv_padded=cu_kv_padded,
-                )
-        if self.config.sequence_parallel and labels is not None:
-            labels_t = labels.transpose(0, 1).contiguous()
-            labels_t = tensor_parallel.scatter_to_sequence_parallel_region(labels_t)
-            labels = labels_t.transpose(0, 1).contiguous()
-        if self.config.sequence_parallel and loss_mask is not None:
-            loss_mask_t = loss_mask.transpose(0, 1).contiguous()
-            loss_mask_t = tensor_parallel.scatter_to_sequence_parallel_region(loss_mask_t)
-            loss_mask = loss_mask_t.transpose(0, 1).contiguous()
-
-        output = self.language_model(
-            input_ids=None,
+        
+        # Call language model
+        return self.language_model(
+            input_ids=input_ids if combined_embeddings is None else None,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            decoder_input=combined_embeddings,
             labels=labels,
             loss_mask=loss_mask,
             inference_params=inference_params,
-            packed_seq_params=local_packed_seq_params,
+            packed_seq_params=packed_seq_params,
+            decoder_input=combined_embeddings,
             **(extra_block_kwargs or {}),
         )
+    
+    # def forward(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     position_ids: torch.Tensor = None,
+    #     attention_mask: torch.Tensor = None,
+    #     labels: torch.Tensor = None,
+    #     loss_mask: torch.Tensor = None,
+    #     inference_params: InferenceParams = None,
+    #     packed_seq_params: PackedSeqParams = None,
+    #     extra_block_kwargs: dict = None,
+    #     pixel_values: torch.Tensor = None,
+    #     pixel_values_videos: torch.Tensor = None,
+    #     image_grid_thw: torch.Tensor = None,
+    #     video_grid_thw: torch.Tensor = None,
+    #     image_grid_hws: torch.Tensor = None,
+    #     image_input_mask: torch.Tensor = None,
+    # ) -> torch.Tensor:
+    #     assert pixel_values_videos is None and video_grid_thw is None, "not support video now"
+    #     assert inference_params is None, "not support inference"
 
-        return output
+    #     image_mask = None
+    #     if self.pre_process and input_ids is not None:
+    #         image_mask = image_input_mask
+    #         if image_mask is None:
+    #             image_mask = (input_ids == self.image_token_id).contiguous()
 
+    #     combined_embeddings = None
+    #     if self.pre_process:
+    #         image_features = None
+    #         if pixel_values is not None and image_mask is not None and image_mask.sum().item() > 0:
+    #             if image_grid_hws is None and image_grid_thw is not None:
+    #                 image_grid_hws = image_grid_thw[:, 1:] if image_grid_thw.shape[-1] == 3 else image_grid_thw
+    #             if image_grid_hws is None:
+    #                 raise ValueError("image_grid_hws is required when pixel_values are provided")
+    #             vision_dtype = getattr(self.vision_model, "dtype", None)
+    #             if vision_dtype is None and hasattr(self.vision_model, "patch_embed"):
+    #                 vision_dtype = self.vision_model.patch_embed.proj.weight.dtype
+    #             if vision_dtype is not None:
+    #                 pixel_values = pixel_values.to(dtype=vision_dtype)
+    #             image_features_list = self.vision_model(pixel_values, image_grid_hws)
+    #             image_features = self.multi_modal_projector(image_features_list)
 
+    #         combined_embeddings = self.language_model.embedding(
+    #             input_ids=input_ids,
+    #             position_ids=None,
+    #         ).clone()
+
+    #         if image_features is not None:
+    #             combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [b, s, h]
+    #             # Temporarily disable sequence_parallel for image features
+    #             # if self.config.sequence_parallel:
+    #             #     tp_size = mpu.get_tensor_model_parallel_world_size()
+    #             #     tp_rank = mpu.get_tensor_model_parallel_rank()
+    #             #     image_mask_chunks = image_mask.chunk(tp_size, dim=-1)
+    #             #     local_image_mask = image_mask_chunks[tp_rank]
+    #             #     counts = [int(m.sum().item()) for m in image_mask_chunks]
+    #             #     start = sum(counts[:tp_rank])
+    #             #     end = start + counts[tp_rank]
+    #             #     local_image_features = image_features[start:end]
+    #             #     combined_embeddings[local_image_mask] = local_image_features
+    #             # else:
+    #             combined_embeddings[image_mask] = image_features
+    #             combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [s, b, h]
+
+    #         # Temporarily disable sequence_parallel scatter for combined_embeddings
+    #     # if self.config.sequence_parallel:
+    #     #     combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
+    #     #     combined_embeddings = combined_embeddings.contiguous()
+
+    #     if position_ids is None and input_ids is not None:
+    #         if attention_mask is not None and attention_mask.dim() == 2:
+    #             position_ids = attention_mask.long().cumsum(-1) - 1
+    #             position_ids.masked_fill_(attention_mask == 0, 1)
+    #         else:
+    #             seq_len = input_ids.size(1)
+    #             position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+
+    #     local_packed_seq_params = packed_seq_params
+    #     if packed_seq_params is not None and input_ids is not None and packed_seq_params.cu_seqlens_q is not None:
+    #         total_tokens = input_ids.shape[1]
+    #         cu_total = int(packed_seq_params.cu_seqlens_q[-1].item())
+    #         scale = None
+    #         if self.config.sequence_parallel:
+    #             tp_size = mpu.get_tensor_model_parallel_world_size()
+    #             if cu_total % tp_size == 0:
+    #                 scale = tp_size
+    #         elif cu_total != total_tokens and cu_total % total_tokens == 0:
+    #             scale = cu_total // total_tokens
+    #         if scale is not None and scale > 1:
+    #             cu_q = packed_seq_params.cu_seqlens_q // scale
+    #             cu_kv = packed_seq_params.cu_seqlens_kv // scale if packed_seq_params.cu_seqlens_kv is not None else None
+    #             cu_q_padded = (
+    #                 packed_seq_params.cu_seqlens_q_padded // scale
+    #                 if packed_seq_params.cu_seqlens_q_padded is not None
+    #                 else None
+    #             )
+    #             cu_kv_padded = (
+    #                 packed_seq_params.cu_seqlens_kv_padded // scale
+    #                 if packed_seq_params.cu_seqlens_kv_padded is not None
+    #                 else None
+    #             )
+    #             local_packed_seq_params = dataclasses.replace(
+    #                 packed_seq_params,
+    #                 cu_seqlens_q=cu_q,
+    #                 cu_seqlens_kv=cu_kv,
+    #                 cu_seqlens_q_padded=cu_q_padded,
+    #                 cu_seqlens_kv_padded=cu_kv_padded,
+    #             )
+    #     # Temporarily disable sequence_parallel scatter for labels and loss_mask
+    #     # to fix shape mismatch in cross-entropy calculation
+    #     # Original code (commented out):
+    #     # if self.config.sequence_parallel and labels is not None:
+    #     #     labels_t = labels.transpose(0, 1).contiguous()
+    #     #     labels_t = tensor_parallel.scatter_to_sequence_parallel_region(labels_t)
+    #     #     labels = labels_t.transpose(0, 1).contiguous()
+    #     # if self.config.sequence_parallel and loss_mask is not None:
+    #     #     loss_mask_t = loss_mask.transpose(0, 1).contiguous()
+    #     #     loss_mask_t = tensor_parallel.scatter_to_sequence_parallel_region(loss_mask_t)
+    #     #     loss_mask = loss_mask_t.transpose(0, 1).contiguous()
+
+    #     # Keep labels and loss_mask as-is to ensure consistent shapes
+    #     # This is a temporary fix for cross-entropy shape mismatch
+
+    #     output = self.language_model(
+    #         input_ids=None,
+    #         position_ids=position_ids,
+    #         attention_mask=attention_mask,
+    #         decoder_input=combined_embeddings,
+    #         labels=labels,
+    #         loss_mask=loss_mask,
+    #         inference_params=inference_params,
+    #         packed_seq_params=local_packed_seq_params,
+    #         **(extra_block_kwargs or {}),
+    #     )
+
+    #     return output
 
 class KimiVLMultiModalProjector(MegatronModule):
     """Megatron-style MultiModal Projector for Vision→Text alignment"""
@@ -263,18 +356,20 @@ class KimiVLMultiModalProjector(MegatronModule):
 
         vision_hidden_size = config.input_size
         merge_k = config.merge_kernel_size
-        self.hidden_size = vision_hidden_size * merge_k[0] * merge_k[1]
+
+        self.input_dim = vision_hidden_size * merge_k[0] * merge_k[1]
+        self.intermediate_size = self.input_dim 
 
         # LayerNorm before projection
         self.pre_norm = nn.LayerNorm(vision_hidden_size, eps=config.layernorm_epsilon)
 
         # Linear 1 — Column Parallel (split output dimension across GPUs)
         self.linear_1 = ColumnParallelLinear(
-            self.hidden_size,
-            self.hidden_size,
+            self.input_dim,
+            self.intermediate_size,
             init_method=config.init_method,
             bias=True,
-            gather_output=True,
+            gather_output=False,
             skip_bias_add=False,
             config=config,
         )
@@ -284,11 +379,11 @@ class KimiVLMultiModalProjector(MegatronModule):
 
         # Linear 2 — Row Parallel (split input dimension)
         self.linear_2 = RowParallelLinear(
-            self.hidden_size,
+            self.intermediate_size,
             config.hidden_size,
             init_method=config.init_method,
             bias=True,
-            input_is_parallel=False,
+            input_is_parallel=True,
             skip_bias_add=False,
             config=config,
         )
@@ -298,7 +393,7 @@ class KimiVLMultiModalProjector(MegatronModule):
         image_features = torch.cat(image_features, dim=0)
 
         # LayerNorm + reshape
-        hidden_states = self.pre_norm(image_features).view(-1, self.hidden_size)
+        hidden_states = self.pre_norm(image_features).view(-1, self.input_dim)
 
         # First Linear projection
         hidden_states, _ = self.linear_1(hidden_states)
